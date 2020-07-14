@@ -15,7 +15,7 @@
 
 #define MAX_POWER 1000 
 
-const char *softAP_ssid = "SWRmeter_sn018";
+const char *softAP_ssid = "SWRmeter_sn030";
 const char *softAP_password = "1234567890";
 const char *myHostname = "esp8266";
  
