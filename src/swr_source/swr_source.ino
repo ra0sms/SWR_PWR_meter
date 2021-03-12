@@ -1,7 +1,8 @@
 /*SWR and Power meter with wifi interface
  * ESP8266 based
  * RA0SMS 2019
- * latest version Aug 2019
+ * latest version Aug 2020
+ * 12032021 - Add switching 2000/1000/200W maxpower (use define)
  */
 
 #include <ESP8266WiFi.h>
@@ -13,9 +14,9 @@
 #include <Ticker.h>
 
 
-#define MAX_POWER 1000 
+#define MAX_POWER 200 
 
-const char *softAP_ssid = "SWRmeter_sn030";
+const char *softAP_ssid = "SWRmeter_sn049";
 const char *softAP_password = "1234567890";
 const char *myHostname = "esp8266";
  
@@ -82,35 +83,68 @@ int readADC ()
   return out;
 }
 
+int readMedian (){
+  int samples = 15;
+  int raw[samples];
+  for (int i = 0; i < samples; i++){
+    raw[i] = analogRead(A0);
+    delayMicroseconds(100);
+  }
+  int temp = 0; 
+  for (int i = 0; i < samples; i++){
+    for (int j = 0; j < samples - 1; j++){
+      if (raw[j] > raw[j + 1]){
+        temp = raw[j];
+        raw[j] = raw[j + 1];
+        raw[j + 1] = temp;
+      }
+    }
+  }
+  return raw[samples/2];
+}
+
 void GetPower()
 {
-  digitalWrite(switch_pin, LOW);
-  delayMicroseconds(1);
-  forwU = readADC();
+  //forwU = readADC();
+  forwU = readMedian();
   digitalWrite(switch_pin, HIGH);
-  delayMicroseconds(1);
-  refrU = readADC();
+  delayMicroseconds(5);
+  //refrU = readADC();
+  refrU = readMedian();
   digitalWrite(switch_pin, LOW);
-  if ((forwU > 70) || (forwU_prev > 70))
+  delayMicroseconds(5);
+  if ((forwU > 50) || (forwU_prev > 50))
   {
     forwU_prev = forwU;
-    if (forwU < 70)
+    if (forwU < 50)
     {
       forwU_prev = 0;
     }
-    //power = ((((forwU * 3000)/1023)/10)*(((forwU * 3000)/1023)/10))/50;
-    power = (forwU*forwU)/1046;
-    power_per = (power / 10);
+    if (MAX_POWER == 1000) 
+    {
+      power = (forwU*forwU)/1046;   // MAX 1000w
+      power_per = (power / 10); // MAX 1000w
+    }
+    if (MAX_POWER == 2000)
+    {
+      power = (forwU*forwU)/523;     // MAX 2000w
+      power_per = (power / 20); // MAX 2000w
+    } 
+    if (MAX_POWER == 200)
+    {
+      power = (forwU*forwU)/5230;     // MAX 200w
+      power_per = (power / 2); // MAX 200w
+    }     
     sum = forwU + refrU;
     raz = forwU - refrU;
-    if ((raz > 0) || (forwU > refrU))
+    if (forwU > refrU)
     {
       swr = (float(sum)) / (float(raz));
       StringSWR = floatToString(swr, 2);
-      delay(4);
+      //delay(1);
     } else {
       StringSWR = "TOO HIGH";
-      delay(1);
+      //delay(1);
     }
   } else
   {
@@ -166,10 +200,10 @@ void buildJavascript() {
   javaScript += "   xmlHttp.onreadystatechange=handleServerResponse;\n";
   javaScript += "   xmlHttp.send(null);\n";
   javaScript += " }\n";
-  javaScript += " setTimeout('process()',10);\n";
+  javaScript += " setTimeout('process()',20);\n";
   javaScript += "}\n";
 
-  javaScript += "function handleServerResponse(){\n";
+  javaScript += "function handleServerResponse(){\n"; 
   javaScript += " if(xmlHttp.readyState==4 && xmlHttp.status==200){\n";
   javaScript += "   xmlResponse=xmlHttp.responseXML;\n";
   javaScript += "   xmldoc = xmlResponse.getElementsByTagName('response');\n";
@@ -360,40 +394,6 @@ void saveCredentials() {
   EEPROM.end();
 }
 
-void setup(void){
-  delay(300);
-  pinMode(switch_pin, OUTPUT);
-  pinMode(led_pin, OUTPUT);
-  Serial.begin(115200);
-  digitalWrite(led_pin, HIGH);
-  Serial.println();
-  Serial.print("Configuring access point...");
-  /* You can remove the password parameter if you want the AP to be open. */
-  WiFi.softAPConfig(apIP, apIP, netMsk);
-  WiFi.softAP(softAP_ssid, softAP_password);
-  delay(500); // Without delay I've seen the IP address blank
-  Serial.print("AP IP address: ");
-  Serial.println(WiFi.softAPIP());
-  dnsServer.setErrorReplyCode(DNSReplyCode::NoError);
-  dnsServer.start(DNS_PORT, "*", apIP); 
-  server.on("/", handleRoot);
-  server.on("/wifi", handleWifi);
-  server.on("/swr", handleSWR);
-  server.on("/wifisave", handleWifiSave);
-  server.on("/generate_204", handleRoot);
-  server.on("/fwlink", handleRoot);  
-  server.on("/xml", handleXML);
-  server.onNotFound(handleNotFound);
-  server.begin(); // Web server start
-  Serial.println("HTTP server started");
-  loadCredentials(); // Load WLAN credentials from network
-  connect = strlen(ssid) > 0; // Request WLAN connect if there is a SSID
-  dnsServer.processNextRequest();
-  server.handleClient();
-  
-  server.begin();
-  Serial.println("HTTP server started");
-}
 
 void connectWifi() {
   Serial.println("Connecting as wifi client...");
@@ -404,9 +404,8 @@ void connectWifi() {
   Serial.println(connRes);
 }
 
-
- 
-void loop(void){
+void routineWIFI()
+{
   if (connect) {
     Serial.println("Connect requested");
     connect = false;
@@ -449,6 +448,46 @@ void loop(void){
       }
     }
   }
+}
+
+void setup(void){
+  delay(100);
+  pinMode(switch_pin, OUTPUT);
+  pinMode(led_pin, OUTPUT);
+  Serial.begin(115200);
+  digitalWrite(led_pin, HIGH);
+  Serial.println();
+  Serial.print("Configuring access point...");
+  /* You can remove the password parameter if you want the AP to be open. */
+  WiFi.softAPConfig(apIP, apIP, netMsk);
+  WiFi.softAP(softAP_ssid, softAP_password);
+  delay(500); // Without delay I've seen the IP address blank
+  Serial.print("AP IP address: ");
+  Serial.println(WiFi.softAPIP());
+  dnsServer.setErrorReplyCode(DNSReplyCode::NoError);
+  dnsServer.start(DNS_PORT, "*", apIP); 
+  server.on("/", handleRoot);
+  server.on("/wifi", handleWifi);
+  server.on("/swr", handleSWR);
+  server.on("/wifisave", handleWifiSave);
+  server.on("/generate_204", handleRoot);
+  server.on("/fwlink", handleRoot);  
+  server.on("/xml", handleXML);
+  server.onNotFound(handleNotFound);
+  server.begin(); // Web server start
+  Serial.println("HTTP server started");
+  loadCredentials(); // Load WLAN credentials from network
+  connect = strlen(ssid) > 0; // Request WLAN connect if there is a SSID
+  dnsServer.processNextRequest();
+  server.handleClient();
+  
+  server.begin();
+  Serial.println("HTTP server started");
+}
+ 
+void loop(void)
+{
+  routineWIFI();
   if (flagAP==1) 
   {
     tim++; 
@@ -459,7 +498,6 @@ void loop(void){
   }
   if ((flagAP==0)&&(tim>0)) tim=sec=minute=hour=day=0;
   if (flagOn == 1) GetPower();
-  
   server.handleClient();
   delay(7);
 }
