@@ -14,9 +14,9 @@
 #include <Ticker.h>
 
 
-#define MAX_POWER 1000       //1000, 2000, 200 
+#define MAX_POWER 2000       //1000, 2000, 200 
 
-const char *softAP_ssid = "SWRmeter_sn067";
+const char *softAP_ssid = "SWRmeter_sn079";
 const char *softAP_password = "1234567890";
 const char *myHostname = "esp8266";
  
