@@ -12,6 +12,8 @@ More information (in Russian) - https://ra0sms.com/swr_power_meter/
 
 ![Pinout](docs/nodemcu_v0.9.jpg)
 
+![Pinout](docs/swr_example.png)
+
 ![](docs/sch.jpg)
 
 ![](docs/1.jpg)
