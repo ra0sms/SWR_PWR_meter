@@ -9,6 +9,11 @@
  * 13102026 - Reliability & security: reconnect on connection loss, no-cache headers,
  *            SWR clamp, dark /swr redesign, SSB/CW/FT8 mode selector, HTTP Basic Auth
  * 14102026 - Restored blocking waitForConnectResult (fixes first-connect WL_WRONG_PASSWORD)
+ * 15102026 - Smooth PEP display: peak-hold sampling on device, fwd/ref measured in pairs,
+ *            time-based ballistics (attack/hold/release) and peak marker in browser,
+ *            WiFi modem sleep off, non-blocking reconnect retries, HTML escaping,
+ *            pages served from PROGMEM, diode offset calibration constant
+ * 16102026 - SoftAP SSID is built from the chip ID (SWRmeter_XXXXXX), no per-device edits
  */
 
 #include <ESP8266WiFi.h>
@@ -19,8 +24,27 @@
 
 // Maximum power range: 200, 300, 1000, 2000
 constexpr int MAX_POWER = 1000;
+static_assert(MAX_POWER == 200 || MAX_POWER == 300 || MAX_POWER == 1000 || MAX_POWER == 2000,
+              "MAX_POWER must be 200, 300, 1000 or 2000");
 
-const char *softAP_ssid = "SWRmeter_sn083";
+// Power calibration: P = (U + DIODE_OFFSET)^2 / POWER_K, U in ADC counts (0..1023)
+constexpr float POWER_K = (MAX_POWER == 2000) ? 523 :
+                          (MAX_POWER == 1000) ? 1046 :
+                          (MAX_POWER == 300)  ? 3487 : 5230;
+// Detector diode drop in ADC counts (1N5711 ~0.2-0.3 V = ~60-90 counts on NodeMCU A0).
+// 0 keeps the classic U^2/K calibration. If you set it, recalibrate POWER_K.
+constexpr int DIODE_OFFSET = 0;
+
+constexpr unsigned int FWD_MIN = 50;      // Forward level below this is noise -> 0 W
+constexpr unsigned int SWR_MIN_FWD = 100; // SWR is computed only above this forward level
+
+// Peak-hold sampling: the reading is the maximum over the last 1-2 bins
+constexpr unsigned long PEAK_BIN_MS = 100;
+constexpr int PAIRS_PER_CALL = 4;         // fwd/ref sample pairs per loop() pass
+
+// SoftAP SSID: prefix + chip ID in hex, set in setup() (e.g. SWRmeter_1A2B3C)
+const char *softAP_prefix = "SWRmeter_";
+char softAP_ssid[24] = "";
 const char *softAP_password = "1234567890";
 
 // Authentication for web pages (HTTP Basic Auth)
@@ -30,18 +54,18 @@ const char *auth_pass = "swr12345";
 
 char ssid[33] = "";      // Max SSID length is 32 chars + null terminator
 char password[64] = "";  // WPA2 allows passwords up to 63 chars + null terminator
-String javaScript, XML, progress, StringSWR;
+String StringSWR;
 
 const int switch_pin = 5;
 const int led_pin = 16;
-unsigned int forwU = 0;
-unsigned int forwU_prev = 0;
-unsigned int refrU = 0;
 int power = 0;
 int power_per = 0;
-float swr = 0;
-unsigned int sum = 0;
-unsigned int raz = 0;
+
+// Peak-hold bins: max forward voltage and the reflected voltage measured right after it
+unsigned int binFwd[2] = {0, 0};
+unsigned int binRef[2] = {0, 0};
+byte curBin = 0;
+unsigned long binStart = 0;
 
 // Uptime tracking using millis()
 unsigned long previousMillis = 0;
@@ -64,6 +88,8 @@ IPAddress apIP(192, 168, 4, 1);
 IPAddress netMsk(255, 255, 255, 0);
 boolean connect;
 unsigned long lastConnectTry = 0;
+const unsigned long RETRY_MS = 30000;
+bool wrongPassword = false; // Set when a user-initiated connect was rejected
 unsigned int status = WL_IDLE_STATUS;
 
 
@@ -71,6 +97,24 @@ String floatToString(float x, byte precision = 2) {
   char tmp[50];
   dtostrf(x, 0, precision, tmp);
   return String(tmp);
+}
+
+// Escape text for safe insertion into HTML (SSIDs come from the air)
+String htmlEscape(const String &s) {
+  String out;
+  out.reserve(s.length() + 8);
+  for (unsigned int i = 0; i < s.length(); i++) {
+    char c = s[i];
+    switch (c) {
+      case '&':  out += F("&amp;");  break;
+      case '<':  out += F("&lt;");   break;
+      case '>':  out += F("&gt;");   break;
+      case '"':  out += F("&quot;"); break;
+      case '\'': out += F("&#39;");  break;
+      default:   out += c;
+    }
+  }
+  return out;
 }
 
 // Returns true if the request is authorized (or auth is disabled)
@@ -81,231 +125,115 @@ bool requireAuth() {
   return false;
 }
 
-int readMedian (){
-  int samples = 12;
-  int raw[samples];
-  for (int i = 0; i < samples; i++){
-    raw[i] = analogRead(A0);
-    delayMicroseconds(200);
-  }
-  int temp = 0; 
-  for (int i = 0; i < samples; i++){
-    for (int j = 0; j < samples - 1; j++){
-      if (raw[j] > raw[j + 1]){
-        temp = raw[j];
-        raw[j] = raw[j + 1];
-        raw[j + 1] = temp;
-      }
-    }
-  }
-  return raw[samples/2];
-}
-
-void GetPower()
-{
-  forwU = readMedian();
-  digitalWrite(switch_pin, HIGH);
-  delayMicroseconds(5);
-  refrU = readMedian();
-  digitalWrite(switch_pin, LOW);
-  delayMicroseconds(5);
-  if ((forwU > 50) || (forwU_prev > 50))
-  {
-    forwU_prev = forwU;
-    if (forwU < 50)
-    {
-      forwU_prev = 0;
-    }
-    int rawPower = 0;
-    if (MAX_POWER == 1000)
-    {
-      rawPower = (forwU*forwU)/1046;   // MAX 1000w
-    }
-    if (MAX_POWER == 2000)
-    {
-      rawPower = (forwU*forwU)/523;     // MAX 2000w
-    }
-    if (MAX_POWER == 200)
-    {
-      rawPower = (forwU*forwU)/5230;     // MAX 200w
-    }
-    if (MAX_POWER == 300)
-    {
-      rawPower = (forwU*forwU)/3487;     // MAX 300w
-    }
-    // Send raw power value - smoothing is done on client side
-    power = rawPower;
-    
-    // Calculate percentage based on max power
-    if (MAX_POWER == 1000) power_per = (power / 10);
-    else if (MAX_POWER == 2000) power_per = (power / 20);
-    else if (MAX_POWER == 200) power_per = (power / 2);
-    else if (MAX_POWER == 300) power_per = (power / 3);
-    
-    sum = forwU + refrU;
-    if (forwU > refrU)
-    {
-      raz = forwU - refrU;
-      swr = (float(sum)) / (float(raz));
-      if (swr > 99.0) swr = 99.0; // Clamp noisy SWR at low power
-      StringSWR = floatToString(swr, 2);
-    } else {
-      StringSWR = ">10";
-    }
-  } else
-  {
-    power = 0;
-    StringSWR = " ";
-  }
-}
-
-
-void handleXML() {
-  if (!requireAuth()) return;
-  buildXML();
+void sendNoCacheHeaders() {
   server.sendHeader("Cache-Control", "no-cache, no-store, must-revalidate");
   server.sendHeader("Pragma", "no-cache");
   server.sendHeader("Expires", "-1");
+}
+
+// Start a chunked HTML response, page is then streamed with sendContent()/sendContent_P()
+void beginPage() {
+  sendNoCacheHeaders();
+  server.setContentLength(CONTENT_LENGTH_UNKNOWN);
+  server.send(200, "text/html", "");
+}
+
+void endPage() {
+  server.sendContent(""); // Terminating chunk
+}
+
+// Average of two ADC reads (noise only, does not flatten envelope peaks)
+unsigned int readAdc2() {
+  unsigned int a = analogRead(A0);
+  delayMicroseconds(50);
+  return (a + analogRead(A0)) / 2;
+}
+
+// Sample forward/reflected in close pairs and keep the peak of the current bin
+void samplePower() {
+  unsigned long now = millis();
+  if (now - binStart >= PEAK_BIN_MS) {
+    if (now - binStart >= 2 * PEAK_BIN_MS) { // Loop was stalled: drop stale data
+      binFwd[0] = binFwd[1] = 0;
+      binRef[0] = binRef[1] = 0;
+    }
+    curBin ^= 1;
+    binFwd[curBin] = 0;
+    binRef[curBin] = 0;
+    binStart = now;
+  }
+  for (int i = 0; i < PAIRS_PER_CALL; i++) {
+    unsigned int f = readAdc2();
+    digitalWrite(switch_pin, HIGH);
+    delayMicroseconds(5);
+    unsigned int r = readAdc2();
+    digitalWrite(switch_pin, LOW);
+    delayMicroseconds(5);
+    if (f > binFwd[curBin]) {
+      binFwd[curBin] = f;
+      binRef[curBin] = r;
+    }
+    delayMicroseconds(200);
+  }
+}
+
+// Convert the peak of the last 100-200 ms into power, bar percent and SWR string
+void computeReading() {
+  byte b = (binFwd[0] >= binFwd[1]) ? 0 : 1;
+  unsigned int forwU = binFwd[b];
+  unsigned int refrU = binRef[b];
+
+  if (forwU < FWD_MIN) {
+    power = 0;
+    power_per = 0;
+    StringSWR = "";
+    return;
+  }
+
+  float u = forwU + DIODE_OFFSET;
+  power = lroundf(u * u / POWER_K);
+  power_per = min(100, power * 100 / MAX_POWER);
+
+  if (forwU < SWR_MIN_FWD) {
+    StringSWR = ""; // Too little power for a meaningful SWR
+  } else if (forwU > refrU) {
+    float swr = float(forwU + refrU) / float(forwU - refrU);
+    if (swr > 99.0) swr = 99.0;
+    StringSWR = floatToString(swr, 2);
+  } else {
+    StringSWR = ">10";
+  }
+}
+
+// Compact endpoint used by the /swr page
+void handleData() {
+  if (!requireAuth()) return;
+  computeReading();
+  String json = "{\"p\":";
+  json += power;
+  json += ",\"s\":\"";
+  json += StringSWR;
+  json += "\"}";
+  sendNoCacheHeaders();
+  server.send(200, "application/json", json);
+}
+
+// Legacy XML endpoint (kept for external integrations)
+void handleXML() {
+  if (!requireAuth()) return;
+  computeReading();
+  String XML = "<?xml version='1.0'?><response><pwr>";
+  XML += power;
+  XML += "</pwr><swr>";
+  XML += StringSWR;
+  XML += "</swr><adcpower>";
+  XML += power_per;
+  XML += "</adcpower></response>";
+  sendNoCacheHeaders();
   server.send(200, "text/xml", XML);
 }
 
-void ProgressBar() {
-  progress = R"(
-<div class="bar"><div id="myBar" class="bar-fill"></div></div>
-)";
-}
-
-void buildXML() {
-  XML = "<?xml version='1.0'?>";
-  XML += "<response>";
-  XML += "<pwr>";
-  XML += String(power);
-  XML += "</pwr>";
-  XML += "<swr>";
-  XML += StringSWR;
-  XML += "</swr>";
-  XML += "<adcpower>";
-  XML += String(power_per, DEC);
-  XML += "</adcpower>";
-  XML += "</response>";
-}
-
-void buildJavascript() {
-  javaScript = R"(
-<script>
-// Smoothing presets per mode (0.0 - 1.0, lower = smoother)
-const MODES = {
-  ssb: { smooth: 0.2, pwr: 0.15, swr: 0.1, decay: 0.5 },
-  cw:  { smooth: 0.3, pwr: 0.4,  swr: 0.15, decay: 0.5 },
-  ft8: { smooth: 0.2, pwr: 0.25, swr: 0.1, decay: 0.4 }
-};
-
-let currentMode = 'ssb'; // actual value is set by handleSWR
-let JS_SMOOTH, JS_SMOOTH_PWR, JS_SMOOTH_SWR, JS_DECAY;
-let smoothBar = -1;
-let smoothPwr = -1;
-let smoothSwr = 1.0;
-
-// Apply smoothing coefficients for a mode and update button highlight
-function applyMode(mode) {
-  const m = MODES[mode];
-  JS_SMOOTH = m.smooth;
-  JS_SMOOTH_PWR = m.pwr;
-  JS_SMOOTH_SWR = m.swr;
-  JS_DECAY = m.decay;
-  smoothBar = -1; smoothPwr = -1; smoothSwr = 1.0;
-  document.querySelectorAll('.mode-btn').forEach(b =>
-    b.classList.toggle('active', b.dataset.mode === mode));
-}
-
-// Switch mode: persist on device and apply coefficients
-function setMode(mode) {
-  if (!MODES[mode]) return;
-  if (mode !== currentMode) {
-    currentMode = mode;
-    fetch('/mode?m=' + mode);
-  }
-  applyMode(mode);
-}
-
-const updateData = () => {
-  fetch('/xml')
-    .then(response => response.text())
-    .then(str => (new window.DOMParser()).parseFromString(str, "text/xml"))
-    .then(xml => {
-      const rawPwr = parseFloat(xml.querySelector("pwr").textContent);
-      const rawSwrText = xml.querySelector("swr").textContent.trim();
-      const rawBar = parseInt(xml.querySelector("adcpower").textContent);
-      
-      // Initialize on first run (using -1 sentinel to handle zero values)
-      if (smoothBar < 0) { smoothBar = rawBar; smoothPwr = rawPwr; }
-      
-      // --- Smooth power value ---
-      const pwrDelta = rawPwr - smoothPwr;
-      smoothPwr = smoothPwr + (pwrDelta >= 0 ? pwrDelta * JS_SMOOTH_PWR : pwrDelta * JS_DECAY);
-      const displayPwr = Math.round(Math.max(smoothPwr, 0));
-      
-      // --- Smooth SWR value ---
-      const rawSwr = parseFloat(rawSwrText);
-      let displaySwr;
-      if (isNaN(rawSwr) || rawSwr <= 0) {
-        displaySwr = (rawSwrText === ">10") ? ">10" : "---";
-        smoothSwr = 1.0;
-      } else {
-        smoothSwr = smoothSwr + (rawSwr - smoothSwr) * JS_SMOOTH_SWR;
-        displaySwr = smoothSwr.toFixed(2);
-      }
-      
-      // --- Smooth bar percentage ---
-      // Instant reset to zero when no power
-      if (rawBar === 0) {
-        smoothBar = 0;
-      } else {
-        const barDelta = rawBar - smoothBar;
-        smoothBar = smoothBar + (barDelta >= 0 ? barDelta * JS_SMOOTH : barDelta * JS_DECAY);
-      }
-      const displayBar = Math.round(Math.min(Math.max(smoothBar, 0), 100));
-      
-      // Update power display
-      document.getElementById('pwrValue').textContent = displayPwr;
-      document.getElementById('swrValue').textContent = displaySwr;
-      
-      // Update progress bar
-      const bar = document.getElementById('myBar');
-      bar.style.width = displayBar + '%';
-      
-      // Dynamic color: green < 50%, yellow 50-80%, red > 80%
-      if (displayBar < 50) {
-        bar.style.background = '#22c55e';
-      } else if (displayBar < 80) {
-        bar.style.background = '#eab308';
-      } else {
-        bar.style.background = '#ef4444';
-      }
-    })
-    .catch(err => console.error('Error:', err));
-  
-  setTimeout(updateData, 100);
-};
-
-document.addEventListener('DOMContentLoaded', () => {
-  applyMode(currentMode);
-  updateData();
-});
-</script>
-)";
-}
-
-void handleSWR() {
-  if (!requireAuth()) return;
-  server.sendHeader("Cache-Control", "no-cache, no-store, must-revalidate");
-  server.sendHeader("Pragma", "no-cache");
-  server.sendHeader("Expires", "-1");
-  buildJavascript();
-  ProgressBar();
-
-  String webPage = R"(
-<!DOCTYPE html>
+static const char SWR_HEAD[] PROGMEM = R"rawliteral(<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8">
@@ -361,12 +289,15 @@ void handleSWR() {
       font-weight: 700;
       font-variant-numeric: tabular-nums;
       line-height: 1.2;
+      transition: opacity .3s ease;
     }
+    .stale .value { opacity: .35; }
     .unit { color: #94a3b8; font-size: .8rem; font-weight: 400; }
     .bar {
-      height: 6px;
+      position: relative;
+      height: 8px;
       background: #0f172a;
-      border-radius: 3px;
+      border-radius: 4px;
       margin-top: 12px;
       overflow: hidden;
     }
@@ -374,8 +305,19 @@ void handleSWR() {
       height: 100%;
       width: 0%;
       background: #22c55e;
-      border-radius: 3px;
-      transition: width .15s ease, background .3s ease;
+      border-radius: 4px;
+      transition: background .3s ease;
+    }
+    .peak {
+      position: absolute;
+      top: 0;
+      bottom: 0;
+      left: 0;
+      width: 2px;
+      margin-left: -2px;
+      background: #f1f5f9;
+      opacity: 0;
+      transition: opacity .3s ease;
     }
     .meta {
       display: flex;
@@ -418,10 +360,9 @@ void handleSWR() {
 <body>
   <div class="card">
     <div class="title">SWR / PWR Meter</div>
-)";
+)rawliteral";
 
-  if (isWiFiConnected == 1) {
-    webPage += R"(
+static const char SWR_METER[] PROGMEM = R"rawliteral(
     <div class="row">
       <div class="cell">
         <div class="label">Power</div>
@@ -429,61 +370,183 @@ void handleSWR() {
       </div>
       <div class="cell">
         <div class="label">SWR</div>
-        <div class="value" id="swrValue">1.00</div>
+        <div class="value" id="swrValue">---</div>
       </div>
     </div>
-)";
-    webPage += progress;
-    webPage += R"(
+    <div class="bar"><div id="myBar" class="bar-fill"></div><div id="peak" class="peak"></div></div>
     <div class="modes">
       <button class="mode-btn" data-mode="ssb" onclick='setMode("ssb")'>SSB</button>
       <button class="mode-btn" data-mode="cw" onclick='setMode("cw")'>CW</button>
       <button class="mode-btn" data-mode="ft8" onclick='setMode("ft8")'>FT8</button>
     </div>
-)";
-  } else {
-    webPage += R"(
+)rawliteral";
+
+static const char SWR_NO_WIFI[] PROGMEM = R"rawliteral(
     <div class="error">
       <strong>Connection required</strong><br>
       <a href='/wifi'>Connect to Wi-Fi</a>
     </div>
-)";
+)rawliteral";
+
+// Meter script. MAX_POWER and currentMode are defined by handleSWR before this block.
+static const char SWR_SCRIPT[] PROGMEM = R"rawliteral(
+<script>
+// Display ballistics per mode: attack/release are time constants (s), hold is ms.
+// The device already sends the peak of the last 100-200 ms (PEP).
+const MODES = {
+  ssb: { attack: 0.03, hold: 1000, release: 0.8 },  // peak reading, readable through speech
+  cw:  { attack: 0.03, hold: 400,  release: 0.4 },  // bridges gaps between dots/dashes
+  ft8: { attack: 0.3,  hold: 0,    release: 0.3 }   // steady carrier: plain averaging
+};
+const PEAK_HOLD = 2000, PEAK_RELEASE = 1.0;  // peak marker on the bar
+const SWR_TAU = 0.3, SWR_HOLD = 3000;        // SWR smoothing, keep last value in pauses
+const POLL_MS = 80, STALE_MS = 2000, TEXT_MS = 200;
+
+let m = MODES.ssb;
+let target = 0, shown = 0, holdT = 0;
+let peak = 0, peakT = 0;
+let swrState = 'none', swrTarget = 1, swrShown = 1, swrT = 0;
+let lastData = 0, lastFrame = 0, lastText = 0;
+let pwrEl, swrEl, barEl, peakEl;
+
+// Apply ballistics for a mode and update button highlight
+function applyMode(mode) {
+  m = MODES[mode];
+  document.querySelectorAll('.mode-btn').forEach(b =>
+    b.classList.toggle('active', b.dataset.mode === mode));
+}
+
+// Switch mode: persist on device and apply ballistics
+function setMode(mode) {
+  if (!MODES[mode]) return;
+  if (mode !== currentMode) {
+    currentMode = mode;
+    fetch('/mode?m=' + mode).catch(() => {});
+  }
+  applyMode(mode);
+}
+
+// Exponential approach towards `to` with time constant tau (s) over dt (s)
+const approach = (from, to, dt, tau) =>
+  tau > 0 ? from + (to - from) * (1 - Math.exp(-dt / tau)) : to;
+
+// Coarser steps at high power so the last digit does not flicker
+const quantize = w => {
+  const step = w >= 1000 ? 10 : w >= 100 ? 5 : 1;
+  return Math.round(w / step) * step;
+};
+
+// Poll the device; the next request is sent only after the previous one finished
+async function poll() {
+  const ctl = new AbortController();
+  const timer = setTimeout(() => ctl.abort(), 2000);
+  try {
+    const r = await fetch('/data', { signal: ctl.signal, cache: 'no-store' });
+    const d = await r.json();
+    const now = performance.now();
+    target = d.p;
+    lastData = now;
+    if (d.s === '>10') {
+      swrState = 'high'; swrT = now;
+    } else if (d.s !== '') {
+      const s = parseFloat(d.s);
+      if (!isNaN(s)) {
+        if (swrState !== 'val') swrShown = s;
+        swrState = 'val'; swrTarget = s; swrT = now;
+      }
+    }
+    // Empty SWR (pause, low power): keep the last value until SWR_HOLD expires
+  } catch (e) {}
+  clearTimeout(timer);
+  setTimeout(poll, POLL_MS);
+}
+
+// Render at display frame rate, independent of network timing
+function frame(t) {
+  const dt = lastFrame ? Math.min((t - lastFrame) / 1000, 0.25) : 0;
+  lastFrame = t;
+
+  const stale = t - lastData > STALE_MS;
+  if (stale) target = 0;
+  document.body.classList.toggle('stale', stale);
+
+  // Power: fast attack, hold, then release
+  if (target >= shown) {
+    shown = approach(shown, target, dt, m.attack);
+    holdT = t;
+  } else if (t - holdT > m.hold) {
+    shown = approach(shown, target, dt, m.release);
   }
 
-  webPage += R"(
+  // Peak marker
+  if (shown >= peak) {
+    peak = shown; peakT = t;
+  } else if (t - peakT > PEAK_HOLD) {
+    peak = approach(peak, shown, dt, PEAK_RELEASE);
+  }
+
+  // SWR
+  if (swrState === 'val') swrShown = approach(swrShown, swrTarget, dt, SWR_TAU);
+  if (swrState !== 'none' && t - swrT > SWR_HOLD) swrState = 'none';
+
+  const pct = Math.min(shown / MAX_POWER * 100, 100);
+  barEl.style.width = pct + '%';
+  barEl.style.background = pct < 50 ? '#22c55e' : pct < 80 ? '#eab308' : '#ef4444';
+  peakEl.style.left = Math.min(peak / MAX_POWER * 100, 100) + '%';
+  peakEl.style.opacity = peak >= 0.5 ? 1 : 0;
+
+  if (t - lastText >= TEXT_MS) {
+    lastText = t;
+    pwrEl.textContent = quantize(shown);
+    swrEl.textContent = swrState === 'val' ? swrShown.toFixed(2) :
+                        swrState === 'high' ? '>10' : '---';
+  }
+  requestAnimationFrame(frame);
+}
+
+document.addEventListener('DOMContentLoaded', () => {
+  pwrEl = document.getElementById('pwrValue');
+  swrEl = document.getElementById('swrValue');
+  barEl = document.getElementById('myBar');
+  peakEl = document.getElementById('peak');
+  applyMode(currentMode);
+  poll();
+  requestAnimationFrame(frame);
+});
+</script>
+)rawliteral";
+
+void handleSWR() {
+  if (!requireAuth()) return;
+  beginPage();
+  server.sendContent_P(SWR_HEAD);
+  server.sendContent_P(isWiFiConnected == 1 ? SWR_METER : SWR_NO_WIFI);
+
+  String meta = R"(
     <div class="meta">
       <span>Max: )";
-  if (MAX_POWER == 1000) webPage += "1000W";
-  else if (MAX_POWER == 200) webPage += "200W";
-  else if (MAX_POWER == 2000) webPage += "2000W";
-  else if (MAX_POWER == 300) webPage += "300W";
-  webPage += R"(</span>
+  meta += MAX_POWER;
+  meta += R"(W</span>
       <a href="/">Home</a>
     </div>
   </div>
 )";
+  server.sendContent(meta);
 
-  webPage += javaScript;
-  webPage += "<script>currentMode = '";
-  if (mode == 1) webPage += "cw";
-  else if (mode == 2) webPage += "ft8";
-  else webPage += "ssb";
-  webPage += "';</script>";
-  webPage += R"(
-</body>
-</html>
-)";
-
-  server.send(200, "text/html", webPage);
+  if (isWiFiConnected == 1) {
+    String cfg = "<script>const MAX_POWER = ";
+    cfg += MAX_POWER;
+    cfg += "; let currentMode = '";
+    cfg += (mode == 1) ? "cw" : (mode == 2) ? "ft8" : "ssb";
+    cfg += "';</script>";
+    server.sendContent(cfg);
+    server.sendContent_P(SWR_SCRIPT);
+  }
+  server.sendContent(F("\n</body>\n</html>\n"));
+  endPage();
 }
 
-void handleRoot() {
-  if (!requireAuth()) return;
-  server.sendHeader("Cache-Control", "no-cache, no-store, must-revalidate");
-  server.sendHeader("Pragma", "no-cache");
-  server.sendHeader("Expires", "-1");
-  String Page = R"(
-<!DOCTYPE html>
+static const char ROOT_HEAD[] PROGMEM = R"rawliteral(<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8">
@@ -544,19 +607,9 @@ void handleRoot() {
   <div class="card">
     <h1>WiFi SWR-PWR Meter</h1>
     <div class="connection-info">
-)";
+)rawliteral";
 
-  if (server.client().localIP() == apIP) {
-    Page += "<p>Connected via <strong>Soft AP</strong>: ";
-    Page += softAP_ssid;
-    Page += "</p>";
-  } else {
-    Page += "<p>Connected to <strong>WiFi Network</strong>: ";
-    Page += ssid;
-    Page += "</p>";
-  }
-
-  Page += R"(
+static const char ROOT_TAIL[] PROGMEM = R"rawliteral(
     </div>
     <div class="nav-links">
       <a class="btn" href='/wifi'>WiFi Configuration</a>
@@ -565,18 +618,29 @@ void handleRoot() {
   </div>
 </body>
 </html>
-)";
+)rawliteral";
 
-  server.send(200, "text/html", Page);
+void handleRoot() {
+  if (!requireAuth()) return;
+  beginPage();
+  server.sendContent_P(ROOT_HEAD);
+
+  String info;
+  if (server.client().localIP() == apIP) {
+    info = "<p>Connected via <strong>Soft AP</strong>: ";
+    info += htmlEscape(softAP_ssid);
+  } else {
+    info = "<p>Connected to <strong>WiFi Network</strong>: ";
+    info += htmlEscape(ssid);
+  }
+  info += "</p>";
+  server.sendContent(info);
+
+  server.sendContent_P(ROOT_TAIL);
+  endPage();
 }
 
-void handleWifi() {
-  if (!requireAuth()) return;
-  server.sendHeader("Cache-Control", "no-cache, no-store, must-revalidate");
-  server.sendHeader("Pragma", "no-cache");
-  server.sendHeader("Expires", "-1");
-  String Page = String(R"(
-<!DOCTYPE html>
+static const char WIFI_HEAD[] PROGMEM = R"rawliteral(<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8">
@@ -699,94 +763,9 @@ void handleWifi() {
   <div class="card">
     <h1>WiFi Configuration</h1>
     <div class="status-card">
-)");
+)rawliteral";
 
-  if (server.client().localIP() == apIP) {
-    Page += F("<p>🔵 Connected via <strong>Soft AP</strong>: ");
-    Page += softAP_ssid;
-    Page += F("</p>");
-  } else {
-    Page += F("<p>🟢 Connected to <strong>WiFi Network</strong>: ");
-    Page += ssid;
-    Page += F("</p>");
-  }
-
-  Page += F("<p>Uptime: <strong>");
-  Page += String(day) + "d " + String(hour) + "h " + String(minute) + "m " + String(sec) + "s";
-  Page += F("</strong></p>");
-  Page += F(R"(
-  </div>
-
-  <div class="status-card">
-    <h3>SoftAP Configuration</h3>
-    <table>
-      <tr><th>Parameter</th><th>Value</th></tr>
-      <tr><td>SSID</td><td>)");
-  Page += softAP_ssid;
-  Page += F(R"(</td></tr>
-      <tr><td>IP Address</td><td>)");
-  Page += WiFi.softAPIP().toString();
-  Page += F(R"(</td></tr>
-    </table>
-  </div>
-
-  <div class="status-card">
-    <h3>WLAN Configuration</h3>
-    <table>
-      <tr><th>Parameter</th><th>Value</th></tr>
-      <tr><td>SSID</td><td>)");
-  Page += ssid;
-  Page += F(R"(</td></tr>
-      <tr><td>IP Address</td><td>)");
-  Page += WiFi.localIP().toString();
-  Page += F(R"(</td></tr>
-    </table>
-  </div>
-
-  <div class="status-card">
-    <h3>Available Networks</h3>
-    <p>Click refresh if networks are missing</p>
-    <table>
-      <tr><th>Network Name</th><th>Signal</th></tr>
-)");
-
-  Serial.println("scan start");
-  int n = WiFi.scanNetworks();
-  Serial.println("scan done");
-
-  if (n > 0) {
-    for (int i = 0; i < n; i++) {
-      Page += F("<tr><td>");
-      Page += WiFi.SSID(i);
-      if (WiFi.encryptionType(i) != ENC_TYPE_NONE) {
-        Page += F(" <small>(secured)</small>");
-      }
-      Page += F("</td><td>");
-      Page += WiFi.RSSI(i);
-      Page += F(" dBm</td></tr>");
-    }
-  } else {
-    Page += F("<tr><td colspan=\"2\">No WiFi networks found</td></tr>");
-  }
-
-  Page += F(R"(
-    </table>
-  </div>
-)");
-
-  // Show validation error if redirected from wifisave
-  if (server.hasArg("error")) {
-    String err = server.arg("error");
-    Page += F("<div class='error-card'>");
-    if (err == "ssid") {
-      Page += F("<strong>Error:</strong> Invalid or missing network name (max 32 chars).");
-    } else if (err == "pass") {
-      Page += F("<strong>Error:</strong> Password too long (max 63 chars).");
-    }
-    Page += F("</div>");
-  }
-
-  Page += F(R"(
+static const char WIFI_TAIL[] PROGMEM = R"rawliteral(
   <form method='POST' action='wifisave'>
     <h3>Connect to Network</h3>
     <label for="n">Network SSID:</label>
@@ -804,9 +783,104 @@ void handleWifi() {
   </div>
 </body>
 </html>
+)rawliteral";
+
+void handleWifi() {
+  if (!requireAuth()) return;
+  beginPage();
+  server.sendContent_P(WIFI_HEAD);
+
+  String Page;
+  if (server.client().localIP() == apIP) {
+    Page += F("<p>🔵 Connected via <strong>Soft AP</strong>: ");
+    Page += htmlEscape(softAP_ssid);
+  } else {
+    Page += F("<p>🟢 Connected to <strong>WiFi Network</strong>: ");
+    Page += htmlEscape(ssid);
+  }
+  Page += F("</p>");
+
+  Page += F("<p>Uptime: <strong>");
+  Page += String(day) + "d " + String(hour) + "h " + String(minute) + "m " + String(sec) + "s";
+  Page += F("</strong></p>");
+  Page += F(R"(
+  </div>
+
+  <div class="status-card">
+    <h3>SoftAP Configuration</h3>
+    <table>
+      <tr><th>Parameter</th><th>Value</th></tr>
+      <tr><td>SSID</td><td>)");
+  Page += htmlEscape(softAP_ssid);
+  Page += F(R"(</td></tr>
+      <tr><td>IP Address</td><td>)");
+  Page += WiFi.softAPIP().toString();
+  Page += F(R"(</td></tr>
+    </table>
+  </div>
+
+  <div class="status-card">
+    <h3>WLAN Configuration</h3>
+    <table>
+      <tr><th>Parameter</th><th>Value</th></tr>
+      <tr><td>SSID</td><td>)");
+  Page += htmlEscape(ssid);
+  Page += F(R"(</td></tr>
+      <tr><td>IP Address</td><td>)");
+  Page += WiFi.localIP().toString();
+  Page += F(R"(</td></tr>
+    </table>
+  </div>
+
+  <div class="status-card">
+    <h3>Available Networks</h3>
+    <p>Click refresh if networks are missing</p>
+    <table>
+      <tr><th>Network Name</th><th>Signal</th></tr>
+)");
+  server.sendContent(Page); // Send status part before the slow network scan
+  Page = "";
+
+  Serial.println("scan start");
+  int n = WiFi.scanNetworks();
+  Serial.println("scan done");
+
+  if (n > 0) {
+    for (int i = 0; i < n; i++) {
+      Page += F("<tr><td>");
+      Page += htmlEscape(WiFi.SSID(i));
+      if (WiFi.encryptionType(i) != ENC_TYPE_NONE) {
+        Page += F(" <small>(secured)</small>");
+      }
+      Page += F("</td><td>");
+      Page += WiFi.RSSI(i);
+      Page += F(" dBm</td></tr>");
+    }
+  } else {
+    Page += F("<tr><td colspan=\"2\">No WiFi networks found</td></tr>");
+  }
+  WiFi.scanDelete();
+
+  Page += F(R"(
+    </table>
+  </div>
 )");
 
-  server.send(200, "text/html", Page);
+  // Show validation error if redirected from wifisave
+  if (server.hasArg("error")) {
+    String err = server.arg("error");
+    Page += F("<div class='error-card'>");
+    if (err == "ssid") {
+      Page += F("<strong>Error:</strong> Invalid or missing network name (max 32 chars).");
+    } else if (err == "pass") {
+      Page += F("<strong>Error:</strong> Password too long (max 63 chars).");
+    }
+    Page += F("</div>");
+  }
+  server.sendContent(Page);
+
+  server.sendContent_P(WIFI_TAIL);
+  endPage();
 }
 
 
@@ -823,9 +897,7 @@ void handleNotFound() {
   for (uint8_t i = 0; i < server.args(); i++) {
     message += " " + server.argName(i) + ": " + server.arg(i) + "\n";
   }
-  server.sendHeader("Cache-Control", "no-cache, no-store, must-revalidate");
-  server.sendHeader("Pragma", "no-cache");
-  server.sendHeader("Expires", "-1");
+  sendNoCacheHeaders();
   server.send(404, "text/plain", message);
 }
 
@@ -847,12 +919,11 @@ void handleWifiSave() {
     newPass.toCharArray(password, sizeof(password));
     server.sendHeader("Location", "wifi", true);
     saveCredentials();
+    wrongPassword = false;
     connect = strlen(ssid) > 0; // Request WLAN connect with new credentials if there is a SSID
   }
 
-  server.sendHeader("Cache-Control", "no-cache, no-store, must-revalidate");
-  server.sendHeader("Pragma", "no-cache");
-  server.sendHeader("Expires", "-1");
+  sendNoCacheHeaders();
   server.send(302, "text/plain", "");    // Empty content inhibits Content-length header so we have to close the socket ourselves.
   server.client().stop(); // Stop is needed because we sent no content length
 }
@@ -893,26 +964,29 @@ void handleMode() {
   if (m == "cw") newMode = 1;
   else if (m == "ft8") newMode = 2;
   mode = newMode; // RAM only, resets to SSB on reboot
-  server.sendHeader("Cache-Control", "no-cache, no-store, must-revalidate");
-  server.sendHeader("Pragma", "no-cache");
-  server.sendHeader("Expires", "-1");
+  sendNoCacheHeaders();
   server.send(200, "text/plain", "OK");
 }
 
 
-void connectWifi() {
+// blocking = true for user-initiated connects (boot, new credentials): waits for the
+// result, which is reliable on first connect. Automatic retries are non-blocking so
+// the web server and captive portal stay responsive.
+void connectWifi(bool blocking) {
   if (strlen(ssid) == 0) return; // No saved credentials
-  Serial.println("Connecting as wifi client...");
+  Serial.println(blocking ? "Connecting as wifi client..." : "Retrying wifi connection...");
   Serial.print("SSID: ");
   Serial.println(ssid);
   Serial.print("Password length: ");
   Serial.println(strlen(password));
   WiFi.disconnect();
   WiFi.begin(ssid, password);
-  // Block until connected or timeout (reliable first connect, matches original behavior)
-  int connRes = WiFi.waitForConnectResult(10000);
-  Serial.print("connRes: ");
-  Serial.println(connRes);
+  if (blocking) {
+    int connRes = WiFi.waitForConnectResult(10000);
+    Serial.print("connRes: ");
+    Serial.println(connRes);
+    wrongPassword = (connRes == WL_WRONG_PASSWORD);
+  }
   lastConnectTry = millis();
 }
 
@@ -921,16 +995,16 @@ void routineWIFI()
   if (connect) {
     Serial.println("Connect requested");
     connect = false;
-    connectWifi();
+    connectWifi(true);
   }
 
   unsigned int s = WiFi.status();
 
-  // Retry if not connected and enough time has passed (skip wrong password)
-  if (s != WL_CONNECTED && s != WL_WRONG_PASSWORD && strlen(ssid) > 0 &&
-      millis() > (lastConnectTry + 30000)) {
+  // Retry if not connected and enough time has passed (skip confirmed wrong password)
+  if (s != WL_CONNECTED && !wrongPassword && strlen(ssid) > 0 &&
+      millis() - lastConnectTry > RETRY_MS) {
     Serial.println("Connection timeout, retrying...");
-    connect = true;
+    connectWifi(false);
   }
 
   if (status != s) { // WLAN status change
@@ -975,12 +1049,17 @@ void setup(void){
   pinMode(led_pin, OUTPUT);
   Serial.begin(115200);
   digitalWrite(led_pin, HIGH);
+  snprintf(softAP_ssid, sizeof(softAP_ssid), "%s%06X", softAP_prefix, ESP.getChipId());
+  // Modem sleep adds 100-300 ms random latency to every response -> jerky meter
+  WiFi.setSleepMode(WIFI_NONE_SLEEP);
   Serial.println();
   Serial.print("Configuring access point...");
   /* You can remove the password parameter if you want the AP to be open. */
   WiFi.softAPConfig(apIP, apIP, netMsk);
   WiFi.softAP(softAP_ssid, softAP_password);
   delay(500); // Without delay I've seen the IP address blank
+  Serial.print("AP SSID: ");
+  Serial.println(softAP_ssid);
   Serial.print("AP IP address: ");
   Serial.println(WiFi.softAPIP());
   dnsServer.setErrorReplyCode(DNSReplyCode::NoError);
@@ -991,6 +1070,7 @@ void setup(void){
   server.on("/wifisave", handleWifiSave);
   server.on("/generate_204", handleRoot);
   server.on("/fwlink", handleRoot);
+  server.on("/data", handleData);
   server.on("/xml", handleXML);
   server.on("/mode", handleMode);
   server.onNotFound(handleNotFound);
@@ -999,12 +1079,12 @@ void setup(void){
   loadCredentials(); // Load WLAN credentials from network
   connect = strlen(ssid) > 0; // Request WLAN connect if there is a SSID
 }
- 
+
 void loop(void)
 {
   routineWIFI();
   dnsServer.processNextRequest();
-  
+
   // Uptime tracking using millis() - independent of loop frequency
   if (isWiFiConnected == 1) {
     unsigned long currentMillis = millis();
@@ -1020,8 +1100,8 @@ void loop(void)
     previousMillis = millis();
     sec = minute = hour = day = 0;
   }
-  
-  if (isWiFiConnected == 1) GetPower();
+
+  if (isWiFiConnected == 1) samplePower();
   server.handleClient();
   delay(7); // Required to prevent WiFi instability with frequent ADC reads
 }
