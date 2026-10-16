@@ -76,6 +76,57 @@ Pre-built binaries for **NodeMCU 0.9 (ESP8266-12E)** (core 3.1.2):
 
 Flash at address `0x00000` using esptool, Arduino IDE or NodeMCU PyFlasher.
 
+### Flashing without Arduino IDE
+
+Download the `.bin` file you need from the table above, connect the NodeMCU board via USB and follow the steps for your OS.
+
+#### Windows (NodeMCU PyFlasher)
+
+1. Install the USB-serial driver if Windows does not recognize the board: **CH340** or **CP2102**, depending on the chip on your board (it is printed next to the USB connector).
+2. Download `NodeMCU-PyFlasher-<version>-x64.exe` from [NodeMCU PyFlasher releases](https://github.com/marcelstoer/nodemcu-pyflasher/releases). It is a single portable program, no installation needed.
+3. Run it and set:
+   - **Serial port** — the COM port of the board (click the refresh button if the list is empty; the port number is also shown in Device Manager → Ports (COM & LPT));
+   - **NodeMCU firmware** — the downloaded `.bin` file;
+   - **Baud rate** — `115200`;
+   - **Flash mode** — `Dual I/O (DIO)`;
+   - **Erase flash** — `yes` for the first flash, `no` for an update (keeps saved Wi-Fi settings).
+4. Click **Flash NodeMCU** and wait for `Firmware successfully flashed` in the console.
+5. Press the **RST** button on the board (or replug USB).
+
+#### Linux (esptool)
+
+1. Install esptool:
+
+   ```bash
+   pip install --user esptool      # or: sudo dnf install esptool / sudo apt install esptool
+   ```
+
+2. Allow access to the serial port (once, then log out and back in):
+
+   ```bash
+   sudo usermod -aG dialout $USER
+   ```
+
+3. Find the board port — usually `/dev/ttyUSB0`:
+
+   ```bash
+   ls /dev/ttyUSB*
+   ```
+
+4. Flash the firmware:
+
+   ```bash
+   python3 -m esptool --port /dev/ttyUSB0 --baud 115200 write_flash -fm dio 0x00000 swr_source_noauth.bin
+   ```
+
+   For the first flash you can clear the whole flash beforehand (this also erases saved Wi-Fi settings):
+
+   ```bash
+   python3 -m esptool --port /dev/ttyUSB0 erase_flash
+   ```
+
+5. Press the **RST** button on the board (or replug USB).
+
 ## Configuration
 
 ### Power range
