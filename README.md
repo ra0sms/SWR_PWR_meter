@@ -148,17 +148,19 @@ pair measured at that peak, so forward and reflected values belong to the same m
 
 The `/swr` page has a **SSB / CW / FT8** mode selector. The browser renders at the display frame rate
 (independent of network timing) with fast attack, hold and slow release, like a peak-reading meter.
+When the carrier disappears, the reading falls to zero quickly (drop time constant 0.08 s) instead of
+creeping down along the release curve.
 Settings are in the `MODES` table of the page script:
 
 | Mode | Attack | Hold | Release | Use case |
 |---|---|---|---|---|
-| SSB | 0.03 s | 1000 ms | 0.8 s | Readable PEP through speech |
-| CW | 0.03 s | 400 ms | 0.4 s | Bridges gaps between dots/dashes |
-| FT8 | 0.3 s | 0 | 0.3 s | Steady averaging for constant-carrier modes |
+| SSB | 0.03 s | 700 ms | 0.6 s | Readable PEP through speech |
+| CW | 0.03 s | 300 ms | 0.3 s | Bridges gaps between dots/dashes |
+| FT8 | 0.05 s | 0 | 0.3 s | Constant carrier: fast rise, light smoothing |
 
 Also:
 
-- The white marker on the bar shows the peak of the last 2 s.
+- The white marker on the bar shows the peak of the last 2 s and goes to zero together with the reading after TX ends.
 - Numbers update 5 times per second; above 100 W the value is rounded to 5 W (above 1000 W — to 10 W).
 - SWR keeps its last value for 3 s during pauses instead of jumping to `---`.
 - If the device stops answering for 2 s, the values dim and the power falls to 0.
@@ -218,6 +220,11 @@ All pages require authentication (if `AUTH_ENABLED = true`). The `/data` and `/x
   - `DIODE_OFFSET` calibration constant, `static_assert` for `MAX_POWER`
   - Pre-built 2000 W firmware
 - **2026-10-16** — SoftAP SSID built from the chip ID (`SWRmeter_XXXXXX`), no per-device edits needed
+- **2026-10-16** — Faster display response:
+  - Power reading falls to zero quickly after TX ends in all modes (fast drop + snap to 0), peak marker follows
+  - Shorter hold/release in SSB and CW
+  - Fast rise in FT8 mode (attack 0.3 s → 0.05 s)
+  - Rebuilt pre-built firmware
 
 > **Note:** the buffer size change shifts the EEPROM layout — saved Wi-Fi credentials are cleared once after this update. Re-enter them via the web interface.
 

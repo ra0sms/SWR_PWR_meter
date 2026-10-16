@@ -14,6 +14,7 @@
  *            WiFi modem sleep off, non-blocking reconnect retries, HTML escaping,
  *            pages served from PROGMEM, diode offset calibration constant
  * 16102026 - SoftAP SSID is built from the chip ID (SWRmeter_XXXXXX), no per-device edits
+ * 16102026 - Power reading falls to zero quickly after TX ends, faster FT8 rise
  */
 
 #include <ESP8266WiFi.h>
@@ -391,14 +392,16 @@ static const char SWR_NO_WIFI[] PROGMEM = R"rawliteral(
 // Meter script. MAX_POWER and currentMode are defined by handleSWR before this block.
 static const char SWR_SCRIPT[] PROGMEM = R"rawliteral(
 <script>
-// Display ballistics per mode: attack/release are time constants (s), hold is ms.
+// Display ballistics per mode: attack/release/drop are time constants (s), hold is ms.
+// release: fall to a lower non-zero level; drop: fall to zero when the carrier is gone.
 // The device already sends the peak of the last 100-200 ms (PEP).
 const MODES = {
-  ssb: { attack: 0.03, hold: 1000, release: 0.8 },  // peak reading, readable through speech
-  cw:  { attack: 0.03, hold: 400,  release: 0.4 },  // bridges gaps between dots/dashes
-  ft8: { attack: 0.3,  hold: 0,    release: 0.3 }   // steady carrier: plain averaging
+  ssb: { attack: 0.03, hold: 700, release: 0.6, drop: 0.08 },  // peak reading, readable through speech
+  cw:  { attack: 0.03, hold: 300, release: 0.3, drop: 0.08 },  // bridges gaps between dots/dashes
+  ft8: { attack: 0.05, hold: 0,   release: 0.3, drop: 0.08 }   // steady carrier: fast rise, light smoothing
 };
 const PEAK_HOLD = 2000, PEAK_RELEASE = 1.0;  // peak marker on the bar
+const ZERO_SNAP = 0.5;                       // below this (W) with no carrier show exactly 0
 const SWR_TAU = 0.3, SWR_HOLD = 3000;        // SWR smoothing, keep last value in pauses
 const POLL_MS = 80, STALE_MS = 2000, TEXT_MS = 200;
 
@@ -475,12 +478,17 @@ function frame(t) {
     shown = approach(shown, target, dt, m.attack);
     holdT = t;
   } else if (t - holdT > m.hold) {
-    shown = approach(shown, target, dt, m.release);
+    // Exponential release never reaches zero: use a fast drop and snap when the carrier is gone
+    shown = approach(shown, target, dt, target > 0 ? m.release : m.drop);
+    if (target === 0 && shown < ZERO_SNAP) shown = 0;
   }
 
-  // Peak marker
+  // Peak marker: held while transmitting, falls with the reading after TX ends
   if (shown >= peak) {
     peak = shown; peakT = t;
+  } else if (shown === 0) {
+    peak = approach(peak, 0, dt, m.drop);
+    if (peak < ZERO_SNAP) peak = 0;
   } else if (t - peakT > PEAK_HOLD) {
     peak = approach(peak, shown, dt, PEAK_RELEASE);
   }
